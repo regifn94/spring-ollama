@@ -15,6 +15,8 @@ import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.io.IOException;
 import java.util.List;
@@ -48,32 +50,47 @@ public class RAGService {
         System.out.println("Loading user data from database...");
 
         System.out.println("Fetching users from database...");
-        List<User> users = userRepository.findAll();
-        System.out.println("Total users found: " + users.size());
+        Flux<User> userFlux = Flux.fromIterable(userRepository.findAll());
 
-        // Konversi data user menjadi dokumen untuk vektor store
-        List<Document> documentList = users.stream()
-                .map(user -> new Document(
-                        "Username: " + user.getUsername() + "\n" +
-                                "Name: " + user.getName() + "\n" +
-                                "Email: " + user.getEmail() + "\n" +
-                                "Role: " + user.getRole() + "\n" +
-                                "Address: " + (user.getAddress() != null ? user.getAddress() : "N/A")
-                ))
-                .collect(Collectors.toList());
+        userFlux.collectList().subscribe(users -> {
+            List<Document> documentList = users.stream()
+                    .map(user -> new Document(String.format(
+                            """
+                            **Username:** %s  
+                            **Name:** %s  
+                            **Email:** %s  
+                            **Role:** %s  
+                            **Address:** %s  
+                            """,
+                            user.getUsername(),
+                            cleanData(user.getName()),  // Membersihkan data kosong/null
+                            cleanData(user.getEmail()),
+                            cleanData(user.getRole()),
+                            cleanData(user.getAddress())
+                    )))
+                    .collect(Collectors.toList());
 
-        // Simpan ke dalam vector store
-        vectorStore.accept(documentList);
+            vectorStore.accept(documentList);
+            System.out.println("User data loading done.");
+        });
+
         System.out.println("User data loading done.");
 
         template = """
-                Answer the questions only using the information in the provided user database.
-                If you do not know the answer, please respond with "I don't know."
+                    You are an AI chatbot named RCC AI Chatbot.
+                
+                    Answer the questions only using the information in the provided user database.
+                    If you do not know the answer, please respond with "I don't know."
+                
+                    USER DATABASE
+                    ---
+                    {documents}
+                    """;
 
-                USER DATABASE
-                ---
-                {documents}
-                """;
+    }
+
+    private String cleanData(String value) {
+        return (value == null || value.trim().isEmpty()) ? "N/A" : value.trim();
     }
 
 
@@ -81,16 +98,13 @@ public class RAGService {
         System.out.println("Received request ..........");
         request.setConversationId(UUID.randomUUID().toString());
 
-        // Retrieval dari vectorStore
         String relevantDocs = vectorStore.similaritySearch(request.getQuery())
                 .stream()
                 .map(Document::getText)
                 .collect(Collectors.joining());
 
-        // Augmented Prompt
         Message systemMessage = new SystemPromptTemplate(template).createMessage(Map.of("documents", relevantDocs));
 
-        // Generasi Respons AI
         Message userMessage = new UserMessage(request.getQuery());
         Prompt prompt = new Prompt(List.of(systemMessage, userMessage));
         ChatClient.CallResponseSpec res = chatClient.prompt(prompt).call();
@@ -103,5 +117,26 @@ public class RAGService {
         return chatResponse;
     }
 
-}
+    public Mono<ChatResponse> ragFlux(QueryRequest request) {
+        System.out.println("Received request ..........");
+        request.setConversationId(UUID.randomUUID().toString());
 
+        return Mono.fromSupplier(() -> vectorStore.similaritySearch(request.getQuery()))
+                .map(docs -> docs.stream().map(Document::getText).collect(Collectors.joining()))
+                .flatMap(relevantDocs -> {
+                    Message systemMessage = new SystemPromptTemplate(template).createMessage(Map.of("documents", relevantDocs));
+                    Message userMessage = new UserMessage(request.getQuery());
+                    Prompt prompt = new Prompt(List.of(systemMessage, userMessage));
+
+                    return Mono.fromSupplier(() -> chatClient.prompt(prompt).call())
+                            .map(res -> {
+                                ChatResponse chatResponse = new ChatResponse();
+                                chatResponse.setResponse(res.content());
+                                chatResponse.setResponseId(request.getConversationId());
+                                System.out.println("Response sent ..........");
+                                return chatResponse;
+                            });
+                });
+    }
+
+}
